@@ -1,0 +1,2 @@
+        curl_easy_setopt(cb->curl, CURLOPT_LOW_SPEED_LIMIT, 1); //  doesn't really matter as long as it is bigger than zero. We just want to be sure it is not stuck
+        curl_easy_setopt(cb->curl, CURLOPT_LOW_SPEED_TIME, 2); //guess it should be interval 
