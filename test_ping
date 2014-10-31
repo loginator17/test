@@ -1,0 +1,692 @@
+/**
+ * collectd src/tcping_tv.c
+ * Copyright (C) 2014       Peter Kozinsky
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; only version 2 of the License is applicable.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * Authors:
+ *   Peter Kozinsky
+ **/
+
+#include "collectd.h"
+#include "common.h"
+#include "plugin.h"
+#include "utils_llist.h"
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <pthread.h>
+#include <netdb.h>
+
+
+#define EPOLL_ARRAY_SIZE   64
+#define PING_MAGIC_CODE    1735289200
+#define PONG_MAGIC_CODE    1735290736
+#define PING_MAX_REPLY_SIZE 16384	//won't support reply size above 16K
+//#define PING_MAX_REPLY_SIZE 16        //won't support reply size above 16K
+#define NUM_REPORTED_METRICS 3	//name,value, percent-where-applicable
+
+static value_t *values = NULL;
+static llist_t *ping_list;
+static int configured_pings;
+
+static char *local_alias;
+static char *local_if = "0.0.0.0";
+static int local_port = 19991;
+static int srv_socket;
+static volatile int doStop;
+
+static pthread_t srv_thread;
+
+static int default_ping_port = 19991;
+static int default_timeout_ms = 100;
+static int default_max_retries = 5;
+static int default_payload_size = 64;
+
+struct ping_connection_s
+{
+    char *alias;
+    char *host;
+    int port;
+    int max_timeout;
+    int max_retries;
+    int retries;
+    int payload_size;
+    char *fallback_host;
+    int fallback_port;
+    int ping_socket;
+    struct sockaddr_in ping_addr;
+    int reconnect_needed;
+    int value_position;
+};
+
+typedef struct ping_connection_s ping_conn_t;
+
+static int configure_local (oconfig_item_t * ci)
+{
+    int i = 0;
+    char *local = NULL;
+
+    cf_util_get_string (ci, &local_alias);
+
+    for (i = 0; i < ci->children_num; i++)
+    {
+	oconfig_item_t *child = ci->children + i;
+
+	if (strcasecmp ("Interface", child->key) == 0)
+	    cf_util_get_string (child, &local);
+	else if (strcasecmp ("Port", child->key) == 0)
+	    cf_util_get_int (child, &local_port);
+	else
+	{
+	    ERROR ("tcping_tv plugin: Invalid configuration option: %s.", child->key);
+	}
+    }
+
+    if (local != NULL)
+    {
+	local_if = local;
+    }
+
+    return 0;
+}
+
+static ping_conn_t *init_ping_struct ()
+{
+    ping_conn_t *conn = (ping_conn_t *) calloc (1, sizeof (ping_conn_t));
+
+    if (NULL != conn)
+    {
+	conn->port = default_ping_port;
+	conn->fallback_port = default_ping_port;
+	conn->max_timeout = default_timeout_ms;
+	conn->max_retries = default_max_retries;
+	conn->payload_size = default_payload_size;
+    }
+
+    return conn;
+}
+
+static int configure_ping (oconfig_item_t * ci)
+{
+    int i = 0;
+    llentry_t *lentry = NULL;
+    ping_conn_t *conn = init_ping_struct ();
+
+    if (NULL == conn)
+	return -1;
+
+    cf_util_get_string (ci, &conn->alias);	//alias
+
+    for (i = 0; i < ci->children_num; i++)
+    {
+	oconfig_item_t *child = ci->children + i;
+
+	if (strcasecmp ("Host", child->key) == 0)
+	    cf_util_get_string (child, &conn->host);
+	else if (strcasecmp ("Port", child->key) == 0)
+	    cf_util_get_int (child, &conn->port);
+	else if (strcasecmp ("TimeoutMS", child->key) == 0)
+	    cf_util_get_int (child, &conn->max_timeout);
+	else if (strcasecmp ("Retries", child->key) == 0)
+	    cf_util_get_int (child, &conn->max_retries);
+	else if (strcasecmp ("PayloadSizeBytes", child->key) == 0)
+	    cf_util_get_int (child, &conn->payload_size);
+	else if (strcasecmp ("FallbackHost", child->key) == 0)
+	    cf_util_get_string (child, &conn->fallback_host);
+	else if (strcasecmp ("FallbackPort", child->key) == 0)
+	    cf_util_get_int (child, &conn->fallback_port);
+	else
+	{
+	    ERROR ("tcping_tv plugin: Invalid configuration option: %s.", child->key);
+	}
+    }
+
+    if (conn->host == NULL)
+    {
+	ERROR ("tcping_tv plugin: Invalid configuration option ignored: no host defined ");
+	free (conn);
+	return -1;
+    }
+    if (conn->port < 256)
+    {
+	conn->port = default_ping_port;
+    }
+    if (conn->alias == NULL)
+    {
+	conn->alias = conn->host;
+    }
+    conn->payload_size = ( conn->payload_size < PING_MAX_REPLY_SIZE )?  conn->payload_size : PING_MAX_REPLY_SIZE;
+
+    conn->value_position = llist_size(ping_list);
+
+    lentry = llentry_create (conn->alias, conn);
+    if (NULL != lentry)
+    {
+	llist_append (ping_list, lentry);
+    }
+
+    return 0;
+}
+
+
+static int tcping_config (oconfig_item_t * ci)	/* {{{ */
+{
+    int i;
+
+    if (ping_list == NULL)
+	ping_list = llist_create ();
+
+    if (NULL == ping_list)
+    {
+	ERROR ("tcping_tv plugin: Failed to create Ping list. Won't ping, only respond");
+    }
+
+
+    for (i = 0; i < ci->children_num; i++)
+    {
+	oconfig_item_t *child = ci->children + i;
+
+	if (strcasecmp ("BIND", child->key) == 0)
+	{
+	    configure_local (child);
+	}
+	else if (strcasecmp ("PING", child->key) == 0)
+	{
+	    configure_ping (child);
+	}
+	else
+	{
+	    ERROR ("tcping_tv plugin: Invalid configuration option: %s.", child->key);
+	}
+    }
+
+    configured_pings = llist_size (ping_list);
+
+    return (0);
+}
+
+static int set_socket_noblocking_nodelay (int sfd)
+{
+    int flags;
+    int on = 1;
+
+    flags = fcntl (sfd, F_GETFL, 0);
+    if (flags == -1)
+    {
+	ERROR ("tcping_tv plugin: Failed to get F_GETFL flags for %d", sfd);
+	return -1;
+    }
+
+    flags |= O_NONBLOCK;
+    if (fcntl (sfd, F_SETFL, flags) == -1)
+    {
+	ERROR ("tcping_tv plugin: Failed to set F_SETFL flags for %d", sfd);
+	return -1;
+    }
+
+    if (setsockopt (sfd, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof (on)))
+    {
+	//we print error, but return OK. less efficient, but not deadly
+	ERROR ("tcping_tv plugin: Could not set socket %d option for tcp_no_delay: %m", sfd);
+    }
+
+    return 0;
+}
+
+static int create_server_socket (char *iface, int port)
+{
+    int sfd;
+    struct sockaddr_in bindaddr;
+
+    sfd = socket (AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0)
+    {
+	ERROR ("tcping_tv plugin: Failed to create server socket");
+	return -1;
+    }
+
+    bindaddr.sin_addr.s_addr = inet_addr (iface);
+    bindaddr.sin_family = AF_INET;
+    bindaddr.sin_port = htons (port);
+
+    if (bind (sfd, (struct sockaddr *) &bindaddr, sizeof (struct sockaddr_in)) < 0)
+    {
+	ERROR ("tcping_tv plugin: Could not bind socket %d to address %s and port %u: %m", sfd, iface, port);
+	close (sfd);
+	return -1;
+    }
+
+    return sfd;
+}
+
+
+static int handle_incoming_ping (int fd)
+{
+    int rc = 0;
+    int goclear = 0;
+    //uint32_t* ping_size = 0;
+    struct timeval *tvp;
+    char buffer[PING_MAX_REPLY_SIZE];
+    uint32_t *ping_magic = (uint32_t *) buffer;
+    uint32_t *ping_size = (uint32_t *) (buffer + sizeof (uint32_t));
+    int tmp = 0;
+
+
+    //OK, dropping all the complexity. assumption that we expect one message at a time. 
+    //If we got more - reply to the first one and drop the rest. 
+    // If arrived more than one message together it is timeout anyway
+    // In theory it would be nice to respond to the last one, but let's start with first
+
+    while (0 < (rc = recv (fd, buffer, sizeof (buffer), 0)))
+    {
+	//we expect size of 'ping/pong magic' + msg size + ping time + pong time
+	//if less or doesn't have magic - malformed- clear socket buffer
+
+	if (rc >= (sizeof (uint32_t) * 2 + sizeof (struct timeval) * 2) && PING_MAGIC_CODE == *ping_magic && !goclear)
+	{
+	    tvp = (struct timeval *) (buffer + sizeof (uint32_t) * 2 + sizeof (struct timeval));
+	    gettimeofday (tvp, NULL);
+
+	    *ping_magic = PONG_MAGIC_CODE;
+	    *ping_size = (*ping_size < sizeof (buffer)) ? *ping_size : sizeof (buffer);
+	    tmp = send (fd, buffer, *ping_size, 0);
+	    if (tmp <= 0)
+		DEBUG ("tcping_tv plugin: SENT PONG size=%d", tmp);
+
+	    if (rc < sizeof (buffer))
+	    {
+		break;
+	    }
+	}
+	goclear = 1;
+    }
+
+    return rc;
+}
+
+static void *ping_server_thread (void __attribute__ ((unused)) * args)
+{
+    int efd, clientsd, fd;
+    struct sockaddr_in peeraddr;
+    socklen_t salen;
+    int pollsize = 1;
+    struct epoll_event ev;
+    struct epoll_event epoll_events[EPOLL_ARRAY_SIZE];
+    uint32_t events;
+    int i;
+    ssize_t rc;
+
+
+    if (listen (srv_socket, SOMAXCONN))
+    {
+	ERROR ("tcping_tv plugin: ping_server_thread: failed to listen %m");
+	goto cleanup;
+    }
+    else
+    {
+	INFO ("tcping_tv plugin: Server socket %d started listening to address %s and port %u", srv_socket, local_if,
+	      local_port);
+    }
+
+    efd = epoll_create1 (0);
+    if (efd < 0)
+    {
+	ERROR (" tcping_tv plugin: ping_server_thread: failed to create epoll %m ");
+	goto cleanup;
+    }
+
+    ev.events = EPOLLIN;
+    ev.data.u64 = 0LL;
+    ev.data.fd = srv_socket;
+
+    if (epoll_ctl (efd, EPOLL_CTL_ADD, srv_socket, &ev) < 0)
+    {
+	ERROR (" tcping_tv plugin: ping_server_thread: failed to create epoll %m ");
+	goto cleanup;
+    }
+
+    while (!doStop && pollsize > 0)
+    {
+	int n;
+
+	n = epoll_wait (efd, epoll_events, EPOLL_ARRAY_SIZE, -1);
+	if (n < 0 && (errno != EINTR))
+	{
+	    ERROR (" tcping_tv plugin: ping_server_thread: epoll_wait failing with error:%d %m ", n);
+	    goto cleanup;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+	    events = epoll_events[i].events;
+	    fd = epoll_events[i].data.fd;
+
+	    if (events & EPOLLERR || events & EPOLLHUP || events & EPOLLRDHUP)
+	    {
+		if (fd == srv_socket)
+		{
+		    ERROR ("tcping_tv plugin: EPoll on server socket failed: %m. Shutting down ping server. Event=%d", events);
+		    //considered to close the thread, but we can probably still respond to already existing sockets
+		    //keeping separate just for different message
+		    //goto cleanup;
+		}
+		else
+		{
+		    DEBUG ("tcping_tv plugin: EPOLLERR/EPOLLHUP/EPOLLRDHUP for socket %d. Closing socket. Event=%d", fd,
+			   events);
+		}
+		close (fd);
+		continue;
+		--pollsize;
+	    }
+
+	    if (events & EPOLLIN)
+	    {
+		ERROR ("PTR_DOC: EPOLLIN");
+		if (fd == srv_socket)
+		{
+		    while (-1 != (clientsd = accept (srv_socket, (struct sockaddr *) &peeraddr, &salen)))
+		    {
+			ev.events = EPOLLIN;	// | EPOLLET;
+			ev.data.u64 = 0LL;
+			ev.data.fd = clientsd;
+			if (-1 == set_socket_noblocking_nodelay (clientsd))
+			{
+			    ERROR ("tcping_tv plugin: Couldn't set client socket %d to non-blocking: %m \n ", clientsd);
+			    continue;
+			}
+
+			if (epoll_ctl (efd, EPOLL_CTL_ADD, clientsd, &ev) < 0)
+			{
+			    ERROR ("tcping_tv plugin: Couldn' t add client socket %d to epoll set: %m \n ", clientsd);
+			    continue;
+			}
+			ERROR ("PTR_DOC: tcping_tv plugin: adding socket to epoll - %d \n ", clientsd);
+
+			++pollsize;
+		    }
+		    if (clientsd == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
+		    {
+			ERROR ("tcping_tv plugin: Experienced error on accept: %m \n ");
+		    }
+		}
+		else
+		{
+		    rc = handle_incoming_ping (fd);
+
+		    if ((fd < 0 && errno != EINTR))
+		    {
+			//not sure we need it here, but no harm
+			DEBUG ("tcping_tv plugin:  Receive from socket %d failed. Closing. %m \n ", fd);
+			--pollsize;
+			close (fd);
+			continue;
+		    }
+
+		    if (rc == 0)
+		    {
+			DEBUG (" tcping_tv plugin: client closed socket %d \n ", fd);
+			--pollsize;
+			close (fd);
+			continue;
+		    }
+		}
+	    }
+	}
+    }
+
+
+  cleanup:
+    close (srv_socket);
+    pthread_exit (NULL);
+    return NULL;
+}
+
+static int ping_connect(ping_conn_t* conn)
+{
+    int rc = 0;
+    struct hostent *he;
+            if (NULL != conn)
+            {
+                 if ( (he = gethostbyname( conn->host ) ) == NULL)
+                 {
+                   ERROR("tcping_tv plugin: Failed to resolve address for %s",conn->alias);
+                   return -1;
+                 }
+
+                 conn->ping_addr.sin_family = AF_INET;
+                 conn->ping_addr.sin_port = htons (conn->port);
+                 memcpy(&(conn->ping_addr.sin_addr), he->h_addr_list[0], he->h_length);
+
+                 conn->ping_socket = socket (AF_INET, SOCK_STREAM, 0);
+                 if (-1 == conn->ping_socket || -1 == set_socket_noblocking_nodelay (srv_socket))
+                 {
+                   ERROR("tcping_tv plugin: Failed to create socket for %s socket=%d",conn->alias, conn->ping_socket);
+                   return -1;
+                 }
+
+                  if( -1 == connect(conn->ping_socket, (struct sockaddr *)&conn->ping_addr, sizeof(conn->ping_addr)))
+                  {
+                     if(errno != EINPROGRESS )
+                     {
+                          ERROR("tcping_tv plugin: Failed to connect to %s   host=%s",conn->alias, conn->host);
+                          return -1;   //we had error and it in not progress
+                     }
+                     //non blocking almoast never connects fast. let's do timeout?
+                     //or actually , let's continue. We should be connected before first ping
+                     //if not, then let's try to reconnect. Waiting here for connect complete doesn't help in any way
+                  }
+            }
+    return rc;
+}
+
+static int ping_connect_all()
+{
+    int rc = 0;
+    llentry_t *lentry;
+
+    if (ping_list != NULL)
+    {
+        for (lentry = llist_head (ping_list); lentry != NULL; lentry = lentry->next)
+        {
+            ping_connect( (ping_conn_t *) lentry->value);
+        }
+    }
+  return rc; 
+}
+
+static int ping(ping_conn_t * conn)
+{
+  int rc = 0;
+  struct timeval  resp_tmout;
+  struct timeval  avail_tmout;
+  char buffer[PING_MAX_REPLY_SIZE];
+  uint32_t *ping_magic = (uint32_t *) buffer;
+  uint32_t *ping_size = (uint32_t *) (buffer + sizeof (uint32_t));
+  struct timeval *tvp = ( struct timeval *) (buffer + sizeof (uint32_t)*2);
+
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(conn->ping_socket, &set);
+
+  resp_tmout.tv_sec = (conn->max_timeout)/1000;
+  resp_tmout.tv_usec = (conn->max_timeout%1000)*1000;
+
+  avail_tmout.tv_sec = (conn->max_timeout*2)/1000;
+  avail_tmout.tv_usec = ((conn->max_timeout*2)%1000)*1000;
+
+  //as we didn't wait for connect on connect, let's check socket is writable.
+  // if not after timeout, we close it and trigger non-blocking reconnect
+  // as connect via firewall might be heavy will put timeout*2 on write-avail wait
+  // shouldn't happen often
+
+  rc = select(conn->ping_socket+1, NULL, &set, NULL, &avail_tmout);
+  if( 0 < rc)
+  {
+     //all good sending ping
+     *ping_magic = PING_MAGIC_CODE;
+     *ping_size = conn->payload_size;
+     gettimeofday (tvp, NULL);
+     rc = send (conn->ping_socket, buffer, conn->payload_size, 0);
+     if (rc == conn->payload_size)
+     {
+         //all good, wait for pong
+         DEBUG ("tcping_tv plugin: SENT PING size=%d", tmp);
+         FD_ZERO(&set);
+         FD_SET(conn->ping_socket, &set);
+         rc = select(conn->ping_socket+1, &set, NULL, NULL, &resp_tmout);
+         if( 0 < rc)
+         {
+            ERROR("PTR_DOC: GOT PONG!!!");
+         }
+         else if( 0 == rc )
+         {
+            ERROR("PTR_DOC: PONG timeouted");
+         }
+         else
+         {
+            ERROR("PTR_DOC: PONG WITING ERROR - reconnect needed");
+         }
+     }
+  }
+  else
+  {
+     //timeout or select error occured, if not EINTR reconnect
+     close(conn->ping_socket);
+     ping_connect(conn);
+  }
+ 
+  return rc;
+}
+
+static int ping_all()
+{
+    int rc = 0;
+    llentry_t *lentry;
+    int i = 0;
+
+    if (ping_list != NULL)
+    {
+        for (lentry = llist_head (ping_list), i = 0; lentry != NULL; i++, lentry = lentry->next)
+        {
+            ping( (ping_conn_t *) lentry->value);
+        }
+    }
+  return rc;
+
+}
+
+static int tcping_init (void)
+{
+
+    values = (value_t *) calloc (NUM_REPORTED_METRICS * configured_pings, sizeof (value_t));
+    if (NULL == values)
+	return (-1);
+
+    srv_socket = create_server_socket (local_if, local_port);
+
+    if (-1 != srv_socket && -1 != set_socket_noblocking_nodelay (srv_socket))
+    {
+	if (pthread_create (&srv_thread, NULL, ping_server_thread, NULL) != 0)
+	{
+	    ERROR ("tcping_tv plugin: pthread_create failed starting server thread. Ping response won't be provided");
+	    return -1;
+	}
+    }
+
+    ping_connect_all();
+
+    return (0);
+}
+
+static int destroy_ping_conn (ping_conn_t * conn)
+{
+    close (conn->ping_socket);
+    free (conn);
+    return 0;
+}
+
+static int tcping_shutdown (void)
+{
+    llentry_t *e_this;
+    llentry_t *e_next;
+    ping_conn_t *conn;
+    doStop = 1;
+
+    if (ping_list != NULL)
+    {
+	for (e_this = llist_head (ping_list); e_this != NULL; e_this = e_next)
+	{
+	    e_next = e_this->next;
+	    conn = (ping_conn_t *) e_this->value;
+	    if (NULL != conn)
+		destroy_ping_conn (conn);
+	    llentry_destroy (e_this);
+	}
+	free (ping_list);
+    }
+
+    free (values);
+
+    close (srv_socket);
+
+    return (0);
+}
+
+static void submit_values (value_t * values, int values_num)
+{
+    if (values_num < 1)
+	return;
+
+    value_list_t vl = VALUE_LIST_INIT;
+
+    vl.values = values;
+    vl.values_len = values_num;
+    sstrncpy (vl.host, hostname_g, sizeof (vl.host));
+    sstrncpy (vl.plugin, "tcping_tv", sizeof (vl.plugin));
+    sstrncpy (vl.type, "tcping_tv", sizeof (vl.type));
+
+    //plugin_dispatch_values (&vl);
+}
+
+static int tcping_read (void)
+{
+#if KERNEL_LINUX
+
+    ping_all();
+    submit_values (values, configured_pings * NUM_REPORTED_METRICS);
+#endif /*KERNEL_LINUX */
+
+    return (0);
+}
+
+void module_register (void)
+{
+    plugin_register_complex_config ("tcping_tv", tcping_config);
+    plugin_register_init ("tcping_tv", tcping_init);
+    plugin_register_shutdown ("tcping_tv", tcping_shutdown);
+    plugin_register_read ("tcping_tv", tcping_read);
+}				/* void module_register */
